@@ -1,0 +1,17 @@
+# IDE
+.idea/
+.vscode/
+
+# Go
+*.test
+*.out
+/bin/
+
+# Rust
+target/
+
+# Env
+.env
+
+# OS
+.DS_Store
