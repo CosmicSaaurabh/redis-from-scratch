@@ -1,3 +1,3 @@
-module github.com/redis-from-scratch
+module github.com/CosmicSaaurabh/redis-from-scratch
 
 go 1.25.4

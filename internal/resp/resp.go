@@ -1,4 +1,4 @@
-package main
+package resp
 
 import (
 	"bufio"
@@ -74,7 +74,7 @@ func (r *Resp) Read() (Value, error) {
 	case BULK:
 		return r.readBulk()
 	default:
-		fmt.Println("Unknown type: %v", string(_type))
+		fmt.Printf("Unknown type: %v\n", string(_type))
 		return Value{}, fmt.Errorf("Unknown type: %v", string(_type))
 	}
 }

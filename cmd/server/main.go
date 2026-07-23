@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net"
+
+	"github.com/CosmicSaaurabh/redis-from-scratch/internal/resp"
 )
 
 func main() {
@@ -25,8 +27,8 @@ func main() {
 	defer conn.Close()
 
 	for {
-		resp := NewResp(conn)
-		value, err := resp.Read()
+		r := resp.NewResp(conn)
+		value, err := r.Read()
 		fmt.Println("Value is: ", value)
 		if err != nil {
 			fmt.Println(err)
