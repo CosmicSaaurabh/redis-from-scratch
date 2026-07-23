@@ -1,0 +1,6 @@
+services:
+  node1:
+    build: .
+    container_name: rfs-node1
+    ports:
+      - "6379:6379"

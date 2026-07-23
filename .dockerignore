@@ -1,0 +1,6 @@
+.git
+.idea
+.claude
+docs
+engine/target
+*.md

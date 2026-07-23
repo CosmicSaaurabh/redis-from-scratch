@@ -22,6 +22,21 @@ This is a deliberate learning project built entirely by hand to master the hard 
 - `docs/tasks/mvp-task-breakdown.md`: the phased plan with definitions of done and edge cases.
 - `CLAUDE.md`: rules of engagement for the AI architect/reviewer guiding this project.
 
+## Local Setup
+
+Prerequisites: Go 1.25+, rustup (the pinned Rust toolchain in `rust-toolchain.toml` installs automatically), and Docker.
+
+```
+git clone git@github.com:CosmicSaaurabh/redis-from-scratch.git
+cd redis-from-scratch
+go build ./... && go test -race ./...
+cd engine && cargo build && cargo test && cd ..
+docker compose up --build
+```
+
+`docker compose up --build` starts a single node listening on port 6379.
+Lint locally with `golangci-lint run` and, in `engine/`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
+
 ## Development Process
 
 Every feature passes three gates, each tracked as a GitHub issue and closed in order: high-level design, low-level design, then implementation.
