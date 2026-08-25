@@ -308,7 +308,12 @@ func FreePort(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("reserve a port: %v", err)
 	}
-	port := l.Addr().(*net.TCPAddr).Port
+	tcp, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		_ = l.Close()
+		t.Fatalf("listener returned a %T, not a TCP address", l.Addr())
+	}
+	port := tcp.Port
 	if err := l.Close(); err != nil {
 		t.Fatalf("release the reserved port: %v", err)
 	}

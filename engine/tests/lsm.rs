@@ -224,7 +224,12 @@ fn an_abandoned_engine_recovers_from_its_log() {
         for i in 0..N {
             db.put(key(i), val(i), 0).unwrap();
         }
-        std::mem::forget(db);
+        // halt() rather than mem::forget: forgetting the engine leaves its
+        // background thread running, so it goes on flushing memtables and
+        // rewriting the manifest underneath the instance opened below. That is
+        // not a crash simulation, it is two engines on one directory, and it
+        // made this test fail intermittently under load.
+        db.halt();
     }
 
     let db = Db::open(small(&dir)).unwrap();
@@ -460,7 +465,7 @@ fn a_torn_log_tail_costs_only_the_unacknowledged_write() {
             db.put(key(i), val(i), 0).unwrap();
         }
         db.sync().unwrap();
-        std::mem::forget(db);
+        db.halt();
     }
 
     // Chop the end of the newest log, exactly as an interrupted write would.

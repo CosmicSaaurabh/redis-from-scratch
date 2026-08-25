@@ -121,7 +121,7 @@ func TestStringCommands(t *testing.T) {
 			{"-1", "-3", ""},
 			{"100", "200", ""},
 		} {
-			if got := c.Str("GETRANGE", "r", tc.start, tc.end); got != tc.want && !(tc.want == "" && got == "") {
+			if got := c.Str("GETRANGE", "r", tc.start, tc.end); got != tc.want {
 				t.Errorf("GETRANGE %s %s = %q want %q", tc.start, tc.end, got, tc.want)
 			}
 		}

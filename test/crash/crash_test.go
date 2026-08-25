@@ -144,14 +144,6 @@ func (n *node) client() *client {
 	return c
 }
 
-func (n *node) set(key, value string) {
-	n.t.Helper()
-	c := n.client()
-	if rep := c.do("SET", key, value); rep.IsError() {
-		n.t.Fatalf("SET %s: %s", key, rep.Str)
-	}
-}
-
 func (n *node) get(key string) (string, bool) {
 	n.t.Helper()
 	c := n.client()

@@ -127,7 +127,7 @@ func Open(opt Options) (*Engine, Recovery, error) {
 	e.Store = memory.New(opt.Clock, e)
 
 	var rec Recovery
-	loader := e.Store.Loader()
+	loader := e.Loader()
 
 	info, err := snapshot.Load(e.snapDir, loader)
 	switch {
@@ -276,7 +276,7 @@ func (e *Engine) Snapshot(ctx context.Context) (string, error) {
 
 	info, err := snapshot.Write(e.snapDir, lsn, e.clk.NowMs(), func(emit snapshot.Emit) error {
 		var ferr error
-		e.Store.ForEach(func(key []byte, rec store.Record) bool {
+		e.ForEach(func(key []byte, rec store.Record) bool {
 			if ferr = emit(key, rec); ferr != nil {
 				return false
 			}

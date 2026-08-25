@@ -12,6 +12,13 @@ CARGO    ?= cargo
 BIN      := bin
 ENGINE   := engine
 PROTO    := proto/engine.proto
+
+# The protobuf plugins are pinned rather than installed with @latest, so that
+# regenerating on two machines produces identical bytes. The generated code is
+# committed, and a check that compares it against a freshly generated copy is
+# only meaningful if the generator is deterministic.
+PROTOC_GEN_GO_VERSION      ?= v1.36.11
+PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.2
 PKG      := github.com/CosmicSaaurabh/redis-from-scratch
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -114,19 +121,36 @@ fmt: ## Format both languages
 # Protobuf
 # ---------------------------------------------------------------------------
 
+.PHONY: proto-tools
+proto-tools: ## Install the pinned protobuf plugins into ./bin
+	@mkdir -p $(BIN)
+	GOBIN="$(CURDIR)/$(BIN)" $(GO) install \
+	  google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	GOBIN="$(CURDIR)/$(BIN)" $(GO) install \
+	  google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+
 .PHONY: proto
-proto: ## Regenerate the Go bindings from proto/engine.proto
+proto: proto-tools ## Regenerate the Go bindings from proto/engine.proto
 	@command -v protoc >/dev/null 2>&1 || { echo "protoc is not installed"; exit 1; }
-	@command -v protoc-gen-go >/dev/null 2>&1 || \
-	  $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	@command -v protoc-gen-go-grpc >/dev/null 2>&1 || \
-	  $(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-	PATH="$$PATH:$$($(GO) env GOPATH)/bin" protoc \
+	PATH="$(CURDIR)/$(BIN):$$PATH" protoc \
 	  --proto_path=proto \
 	  --go_out=. --go_opt=module=$(PKG) \
 	  --go-grpc_out=. --go-grpc_opt=module=$(PKG) \
 	  $(PROTO)
+	@$(MAKE) --no-print-directory proto-normalise
 	@echo "the Rust side regenerates from build.rs on the next cargo build"
+
+.PHONY: proto-normalise
+proto-normalise: ## Strip the protoc binary version from the generated headers
+	@# The plugins are pinned, but the protoc binary itself is whatever the
+	@# machine has - 33.x from Homebrew, 3.21 from Debian - and it stamps its
+	@# own version into a comment. That is a property of the environment, not
+	@# of the contract, so it is normalised away rather than allowed to make
+	@# proto-check fail on a difference that means nothing.
+	@for f in internal/enginepb/*.pb.go; do \
+	  sed -i.bak -E 's|(protoc)([[:space:]]+)v[0-9][0-9.]*|\1\2(pinned via the Makefile)|' "$$f"; \
+	  rm -f "$$f.bak"; \
+	done
 
 .PHONY: proto-check
 proto-check: ## Fail if the generated bindings are stale

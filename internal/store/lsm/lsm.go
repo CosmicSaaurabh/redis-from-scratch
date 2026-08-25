@@ -333,8 +333,8 @@ func (s *Store) Scan(ctx context.Context, cursor uint64, count int, fn func(key 
 		if !ok {
 			return 0, fmt.Errorf("lsm: scan cursor %d is unknown or has expired", cursor)
 		}
-		e := v.(cursorEntry)
-		if time.Since(e.issuedAt) > cursorTTL {
+		e, ok := v.(cursorEntry)
+		if !ok || time.Since(e.issuedAt) > cursorTTL {
 			s.cursors.Delete(cursor)
 			return 0, fmt.Errorf("lsm: scan cursor %d expired after %s", cursor, cursorTTL)
 		}
@@ -374,7 +374,8 @@ func (s *Store) nextCursor(start []byte) uint64 {
 func (s *Store) expireCursors() {
 	cutoff := time.Now().Add(-cursorTTL)
 	s.cursors.Range(func(k, v any) bool {
-		if v.(cursorEntry).issuedAt.Before(cutoff) {
+		e, ok := v.(cursorEntry)
+		if !ok || e.issuedAt.Before(cutoff) {
 			s.cursors.Delete(k)
 		}
 		return true

@@ -367,10 +367,7 @@ func TestSavePointTriggersBackgroundSnapshot(t *testing.T) {
 		mustPut(t, e, fmt.Sprintf("k%02d", i), "v")
 	}
 	deadline := time.After(5 * time.Second)
-	for {
-		if e.PersistenceStats().Saves > 0 {
-			break
-		}
+	for e.PersistenceStats().Saves == 0 {
 		select {
 		case <-deadline:
 			t.Fatal("no background snapshot after 5s with a satisfied save point")

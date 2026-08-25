@@ -139,6 +139,11 @@ jobs:
       # Generated code is committed so that a clean checkout builds without
       # protoc. This guards the other half of that bargain: the committed code
       # must actually match the contract it was generated from.
+      #
+      # The plugins are pinned in the Makefile and the protoc binary's own
+      # version is normalised out of the generated header, so this compares the
+      # contract rather than which build of protoc the runner happened to
+      # install.
       - name: Regenerate and diff
         run: make proto-check
 

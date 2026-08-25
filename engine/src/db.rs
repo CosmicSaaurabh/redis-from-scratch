@@ -216,6 +216,9 @@ struct Inner {
     last_periodic_sync: Mutex<Instant>,
 
     stopping: AtomicBool,
+    /// Set when the engine is being stopped *without* flushing, to simulate a
+    /// process that stopped existing. See [`Db::halt`].
+    halted: AtomicBool,
     /// Latches the first background failure. Once the engine cannot flush, it
     /// must stop accepting writes rather than acknowledging data it will lose.
     fatal: Mutex<Option<String>>,
@@ -303,6 +306,7 @@ impl Db {
             space_available: Condvar::new(),
             last_periodic_sync: Mutex::new(Instant::now()),
             stopping: AtomicBool::new(false),
+            halted: AtomicBool::new(false),
             fatal: Mutex::new(None),
             counters: Counters::default(),
         });
@@ -419,6 +423,31 @@ impl Db {
     /// Engine counters.
     pub fn stats(&self, now_ms: i64) -> Result<Stats> {
         self.inner.stats(now_ms)
+    }
+
+    /// Stops all background work without flushing, syncing or closing anything.
+    ///
+    /// This exists so that a test can simulate a process that stopped existing
+    /// and then reopen the same directory. Dropping or forgetting a `Db`
+    /// instead is not a crash simulation and is actively unsafe: the background
+    /// thread keeps running, so it goes on flushing memtables and rewriting the
+    /// manifest underneath whatever opens the directory next.
+    ///
+    /// Whatever was already fsynced survives. Nothing else is expected to.
+    pub fn halt(&self) {
+        self.inner.halted.store(true, Ordering::SeqCst);
+        if self.inner.stopping.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        {
+            let mut w = self.inner.work.lock().expect("work lock");
+            *w = true;
+            self.inner.work_ready.notify_all();
+            self.inner.space_available.notify_all();
+        }
+        if let Some(h) = self.background.lock().expect("bg lock").take() {
+            let _ = h.join();
+        }
     }
 
     /// Stops the background thread and flushes durably.
@@ -616,7 +645,11 @@ impl Inner {
             }
         }
 
-        let version = Arc::clone(&self.version.read().expect("version lock"));
+        // Held rather than cloned: compaction deletes a file only after
+        // installing the version that stops naming it, so holding a read guard
+        // for the duration of the lookup is what stops this read from opening a
+        // file that is being removed underneath it.
+        let version = self.version.read().expect("version lock");
         for f in version.level(0) {
             if let Some(answer) = self.lookup_file(f, key, now_ms)? {
                 return Ok(answer);
@@ -684,6 +717,7 @@ impl Inner {
         let take = limit + 1;
         let mut merged: std::collections::BTreeMap<Vec<u8>, Option<Record>> =
             std::collections::BTreeMap::new();
+
         // The merge is only complete up to this key.
         //
         // A source cut off at `take` entries was read no further than its own
@@ -692,36 +726,69 @@ impl Inner {
         // that boundary silently drops keys, which is how a scan loses data
         // without ever erroring.
         let mut boundary: Option<Vec<u8>> = None;
-        let note = |k: Option<Vec<u8>>, boundary: &mut Option<Vec<u8>>| {
+        fn note(k: Option<Vec<u8>>, boundary: &mut Option<Vec<u8>>) {
             if let Some(k) = k {
                 match boundary {
                     Some(b) if *b <= k => {}
                     _ => *boundary = Some(k),
                 }
             }
-        };
+        }
 
-        // Collect oldest source first and let newer ones overwrite, so the map
-        // ends holding the winning version of every key.
-        let version = Arc::clone(&self.version.read().expect("version lock"));
-        for level in (1..version.level_count()).rev() {
-            for f in version.level(level) {
-                let cut = self.collect_from_file(f, start, take, &mut merged)?;
-                note(cut, &mut boundary);
-            }
-        }
-        for f in version.level(0).iter().rev() {
-            let cut = self.collect_from_file(f, start, take, &mut merged)?;
-            note(cut, &mut boundary);
-        }
+        // The version is held for the whole scan, and the memtables are read
+        // while holding it. Both halves matter.
+        //
+        // Reading the version and the memtables at two different instants is a
+        // silent data-loss bug: a flush moves records out of a memtable and
+        // into a new version, so a reader that snapshots the version first and
+        // the memtables second can observe a moment where the flushed records
+        // are in neither. They do not come back as an error - they come back as
+        // the *older* value the flushed records were shadowing, which after a
+        // FLUSHALL means deleted keys returning to life.
+        //
+        // Holding the version also keeps compaction from deleting a file this
+        // scan is about to open, which otherwise surfaces as a spurious
+        // "no such file" in the middle of a perfectly valid read.
+        let version = self.version.read().expect("version lock");
+
+        // Memtable contents are copied out now, at the same instant as the
+        // version, but applied last, because they are newer than every file.
+        let mut newest: std::collections::BTreeMap<Vec<u8>, Option<Record>> =
+            std::collections::BTreeMap::new();
         {
             let m = self.mem.read().expect("memtable lock");
             for fz in m.immutable.iter().rev() {
-                let cut = collect_from_memtable(&fz.table, start, take, now_ms, &mut merged);
-                note(cut, &mut boundary);
+                note(
+                    collect_from_memtable(&fz.table, start, take, now_ms, &mut newest),
+                    &mut boundary,
+                );
             }
-            let cut = collect_from_memtable(&m.active, start, take, now_ms, &mut merged);
-            note(cut, &mut boundary);
+            note(
+                collect_from_memtable(&m.active, start, take, now_ms, &mut newest),
+                &mut boundary,
+            );
+        }
+
+        // Files, oldest source first, so newer ones overwrite.
+        for level in (1..version.level_count()).rev() {
+            for f in version.level(level) {
+                note(
+                    self.collect_from_file(f, start, take, &mut merged)?,
+                    &mut boundary,
+                );
+            }
+        }
+        for f in version.level(0).iter().rev() {
+            note(
+                self.collect_from_file(f, start, take, &mut merged)?,
+                &mut boundary,
+            );
+        }
+        drop(version);
+
+        // Memtables win over every file.
+        for (k, v) in newest {
+            merged.insert(k, v);
         }
 
         let mut out = Vec::with_capacity(limit.min(merged.len()));
@@ -983,8 +1050,12 @@ impl Inner {
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 // Drain what is pending so a clean shutdown does not leave work
-                // for the next start to redo from the log.
-                let _ = self.drain_flushes();
+                // for the next start to redo from the log - unless the engine
+                // is being halted, which is meant to look like a process that
+                // stopped existing and therefore must do nothing at all.
+                if !self.halted.load(Ordering::Acquire) {
+                    let _ = self.drain_flushes();
+                }
                 return;
             }
 

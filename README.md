@@ -141,11 +141,13 @@ reason is written at the assertion.
 
 ## What the tests caught
 
-Eleven real bugs, including three that would have caused **silent data loss** —
+Thirteen real bugs, including five that would have caused **silent data loss** —
 no error, no crash, just wrong answers later:
 
 | bug | why it mattered |
 |---|---|
+| the LSM scan read the version and the memtables at **different instants** | a flush landing in that gap moved records out of the memtables and into a version the reader was not looking at, so they were in neither — and the scan returned the *older* values they had been shadowing. After a `FLUSHALL` that meant **383 deleted keys coming back to life** |
+| the LSM scan opened files compaction had already deleted | a valid read failed with "no such file" because the reader held a stale version snapshot |
 | `FLUSHALL` scanned at `i64::MAX`, meaning "see everything" | it means the opposite: every key with a TTL looked expired, was skipped, never got a tombstone, and **came back alive** on the next read |
 | the LSM scan emitted past a truncated source's boundary | **lost 367 of 1500 keys** with no error at all |
 | `everysec` never pushed log bytes to the kernel | acknowledged writes sat in process memory, where a plain kill destroyed them |
@@ -156,8 +158,13 @@ no error, no crash, just wrong answers later:
 | socket deadlines read from the injected clock | armed the kernel with a deadline in the past |
 | the paged scan was O(n²) | collected whole files per page |
 
-The first two were found by tests asserting the **complete** expected set after
-a full walk. Spot-checking a few keys would have passed both.
+Several were found by tests asserting the **complete** expected set after a full
+walk. Spot-checking a few keys would have passed every one of them.
+
+The two scan bugs at the top only appear when background work runs concurrently
+with a read, so they survived the whole single-threaded suite and were caught by
+CI running the tests in parallel on a different machine. They are pinned now by
+`engine/tests/concurrency.rs`, which reproduces both deterministically.
 
 ---
 

@@ -264,7 +264,14 @@ func (l *Log) append(typ RecordType, encode func([]byte) []byte) (uint64, error)
 	if err := l.Fatal(); err != nil {
 		return 0, err
 	}
-	sp := scratchPool.Get().(*[]byte)
+	sp, ok := scratchPool.Get().(*[]byte)
+	if !ok {
+		// Cannot happen: the pool's New returns exactly this type. Falling back
+		// rather than asserting keeps a pool misconfiguration from panicking on
+		// the write path.
+		buf := make([]byte, 0, 512)
+		sp = &buf
+	}
 	payload := encode((*sp)[:0])
 
 	l.mu.Lock()
