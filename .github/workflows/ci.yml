@@ -84,6 +84,9 @@ jobs:
       # The same commands go to this server and to a real redis-server and the
       # replies are compared byte for byte. Hand-written expectations encode
       # what the author believes Redis does; this encodes what it actually does.
+      # Under the race detector, because the harness starting a server and
+      # waiting for it to bind is exactly the cross-goroutine access pattern a
+      # supervisor or health check has, and a race there is a real one.
       - name: Differential comparison against redis-server
         run: go test -race -count=1 -timeout 300s ./test/compat/...
 

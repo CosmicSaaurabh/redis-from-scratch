@@ -56,7 +56,13 @@ type Server struct {
 	version   string
 	startedAt time.Time
 
+	// ln is guarded by mu. addr caches its resolved string separately, because
+	// Addr is called from other goroutines - a supervisor, a health check, a
+	// test harness waiting for the bind - while Serve is assigning ln, and an
+	// unsynchronised read of an interface value there is a genuine data race,
+	// not a theoretical one.
 	ln       net.Listener
+	addr     atomic.Pointer[string]
 	flushWAL walFlusher
 
 	// slots bounds concurrent connections. A buffered channel is used rather
@@ -156,12 +162,14 @@ func New(opt Options) (*Server, error) {
 	return s, nil
 }
 
-// Addr returns the address the server is listening on, or empty before Serve.
+// Addr returns the address the server is listening on, or empty before Serve
+// has bound it. It is safe to call from any goroutine at any time, which is
+// what a caller waiting for the server to come up needs.
 func (s *Server) Addr() string {
-	if s.ln == nil {
-		return ""
+	if p := s.addr.Load(); p != nil {
+		return *p
 	}
-	return s.ln.Addr().String()
+	return ""
 }
 
 // ShutdownRequests yields true when a client asked for a shutdown with a final
@@ -176,7 +184,12 @@ func (s *Server) Serve() error {
 	if err != nil {
 		return fmt.Errorf("server: listen on %s: %w", s.cfg.Addr, err)
 	}
+	s.mu.Lock()
 	s.ln = ln
+	s.mu.Unlock()
+	resolved := ln.Addr().String()
+	s.addr.Store(&resolved)
+
 	s.log.Info("accepting connections",
 		"addr", ln.Addr().String(), "engine", s.store.Name(), "maxclients", s.cfg.MaxClients)
 
@@ -236,18 +249,25 @@ func (s *Server) Close() error {
 	var err error
 	s.stopOnce.Do(func() {
 		s.cancel()
-		if s.ln != nil {
-			err = s.ln.Close()
-		}
 
 		// Cancelling the context is not enough on its own: a goroutine blocked
-		// in a socket read does not observe a context. Every connection is
-		// closed explicitly, which is what actually unblocks those reads.
+		// in a socket read does not observe a context. The listener and every
+		// connection are closed explicitly, which is what actually unblocks
+		// those reads.
 		s.mu.Lock()
+		ln := s.ln
+		conns := make([]*connection, 0, len(s.conns))
 		for _, c := range s.conns {
-			c.close()
+			conns = append(conns, c)
 		}
 		s.mu.Unlock()
+
+		if ln != nil {
+			err = ln.Close()
+		}
+		for _, c := range conns {
+			c.close()
+		}
 
 		done := make(chan struct{})
 		go func() { s.wg.Wait(); close(done) }()
