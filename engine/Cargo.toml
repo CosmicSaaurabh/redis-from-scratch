@@ -1,6 +1,39 @@
 [package]
 name = "engine"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.91"
+description = "LSM-tree storage engine for redis-from-scratch"
+license = "MIT"
+publish = false
+
+[lib]
+name = "engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rfs-engine"
+path = "src/bin/rfs-engine.rs"
 
 [dependencies]
+crc32fast = "1.5"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tonic = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
