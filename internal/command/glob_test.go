@@ -88,3 +88,33 @@ func FuzzMatchPattern(f *testing.F) {
 		_ = matchPattern([]byte(pattern), []byte(s), true)
 	})
 }
+
+func TestResolveRangeMatchesRedis(t *testing.T) {
+	// The expectations below were taken from redis-server 8.4 rather than from
+	// the documentation, which does not describe the clamping behaviour.
+	cases := []struct {
+		start, end, length int64
+		wantLo, wantHi     int64
+		wantEmpty          bool
+	}{
+		{0, 3, 16, 0, 3, false},
+		{-3, -1, 16, 13, 15, false},
+		{0, -1, 16, 0, 15, false},
+		{10, 100, 16, 10, 15, false},
+		{-1, -3, 16, 0, 0, true},
+		{100, 200, 16, 0, 0, true},
+		// An end still negative after adjustment clamps to the first byte
+		// rather than selecting nothing.
+		{-100, -90, 16, 0, 0, false},
+		{-100, -1, 16, 0, 15, false},
+		{5, 5, 16, 5, 5, false},
+		{0, 0, 0, 0, 0, true},
+	}
+	for _, c := range cases {
+		lo, hi, empty := resolveRange(c.start, c.end, c.length)
+		if empty != c.wantEmpty || (!empty && (lo != c.wantLo || hi != c.wantHi)) {
+			t.Errorf("resolveRange(%d, %d, %d) = %d,%d,%v want %d,%d,%v",
+				c.start, c.end, c.length, lo, hi, empty, c.wantLo, c.wantHi, c.wantEmpty)
+		}
+	}
+}

@@ -609,9 +609,12 @@ func resolveRange(start, end, length int64) (lo, hi int64, empty bool) {
 	if end < 0 {
 		end += length
 		if end < 0 {
-			// A negative end that is still out of range after adjustment
-			// selects nothing, rather than clamping to the first byte.
-			return 0, 0, true
+			// An end that is still negative after adjustment clamps to the
+			// first byte rather than selecting nothing. That looks arbitrary
+			// and is: it is what Redis does, verified against redis-server in
+			// test/compat. GETRANGE k -100 -90 on a 16 byte string returns its
+			// first byte, not an empty string.
+			end = 0
 		}
 	}
 	if end >= length {

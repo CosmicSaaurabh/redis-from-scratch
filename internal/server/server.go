@@ -435,7 +435,7 @@ func (s *Server) handleReadError(conn *connection, w *resp.Writer, r *resp.Reade
 			s.log.Debug("dropping client that stalled mid-command", "client", conn.state.ID)
 			return false
 		}
-		if !idleDeadline.IsZero() && s.clk.Now().After(*idleDeadline) {
+		if !idleDeadline.IsZero() && time.Now().After(*idleDeadline) {
 			s.stat.TimeoutDisconnects.Add(1)
 			return false
 		}
@@ -533,11 +533,20 @@ func (s *Server) expireCycle() (sampled, expired int) {
 	return sampled, expired
 }
 
+// deadlineFor computes a socket deadline.
+//
+// It reads the wall clock directly rather than the server's injected clock.
+// The injected clock exists so that TTL semantics can be tested without
+// sleeping, and it can legitimately be frozen or set to any instant; handing
+// such a value to SetReadDeadline would arm the kernel with a deadline that is
+// already in the past and every read would fail instantly. Expiry is a
+// semantic decision and belongs to the injected clock; a socket deadline is an
+// instruction to the operating system and belongs to real time.
 func (s *Server) deadlineFor(d time.Duration) time.Time {
 	if d <= 0 {
 		return time.Time{}
 	}
-	return s.clk.Now().Add(d)
+	return time.Now().Add(d)
 }
 
 func nc(c *connection) net.Conn { return c.nc }

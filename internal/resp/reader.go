@@ -280,6 +280,12 @@ func ioOrUnexpected(err error) error {
 }
 
 // parseInt parses a base-10 signed integer without allocating.
+//
+// The accumulator is unsigned so that the most negative int64 is
+// representable. Accumulating in int64 and negating at the end cannot parse
+// -9223372036854775808, because its magnitude is one past the largest positive
+// int64, and a parser that rejects a value the type can hold makes INCR and
+// DECR behave differently at the two ends of the range.
 func parseInt(b []byte) (int64, bool) {
 	if len(b) == 0 {
 		return 0, false
@@ -293,22 +299,28 @@ func parseInt(b []byte) (int64, bool) {
 			return 0, false
 		}
 	}
-	var v int64
+	limit := uint64(1<<63 - 1)
+	if neg {
+		limit = 1 << 63
+	}
+	var v uint64
 	for ; i < len(b); i++ {
 		c := b[i]
 		if c < '0' || c > '9' {
 			return 0, false
 		}
-		d := int64(c - '0')
-		if v > (1<<63-1-d)/10 {
+		d := uint64(c - '0')
+		if v > (limit-d)/10 {
 			return 0, false
 		}
 		v = v*10 + d
 	}
 	if neg {
-		return -v, true
+		// Negating through uint64 keeps the minimum value from overflowing on
+		// the way back into int64.
+		return -int64(v-1) - 1, true
 	}
-	return v, true
+	return int64(v), true
 }
 
 // ParseInt exposes the allocation-free integer parser to command handlers,

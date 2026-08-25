@@ -242,3 +242,28 @@ func FuzzReadCommand(f *testing.F) {
 		}
 	})
 }
+
+func TestParseIntHandlesTheInt64Boundaries(t *testing.T) {
+	// The most negative int64 has a magnitude one past the largest positive
+	// one. A parser that accumulates in int64 and negates at the end silently
+	// rejects it, which would make DECR behave differently at the two ends of
+	// the range.
+	cases := []struct {
+		in   string
+		want int64
+		ok   bool
+	}{
+		{"-9223372036854775808", -1 << 63, true},
+		{"9223372036854775807", 1<<63 - 1, true},
+		{"-9223372036854775809", 0, false},
+		{"9223372036854775808", 0, false},
+		{"-0", 0, true},
+		{"+9223372036854775807", 1<<63 - 1, true},
+	}
+	for _, c := range cases {
+		got, ok := ParseInt([]byte(c.in))
+		if ok != c.ok || (ok && got != c.want) {
+			t.Errorf("ParseInt(%q) = %d,%v want %d,%v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
