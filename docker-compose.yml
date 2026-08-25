@@ -1,6 +1,100 @@
+# Local development stacks.
+#
+# The default stack is a single node with the in-process engine, which is what
+# most work needs. The `lsm` profile adds the Rust storage engine as a second
+# container, so the gRPC boundary between the two languages is exercised the
+# way it will actually be deployed rather than only in tests.
+#
+#   docker compose up                    # single node, in-process engine
+#   docker compose --profile lsm up      # server plus the Rust storage engine
+
 services:
-  node1:
-    build: .
-    container_name: rfs-node1
+  node:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+    image: rfs:latest
+    container_name: rfs-node
     ports:
       - "6379:6379"
+      - "9121:9121"
+    volumes:
+      - node-data:/data
+    environment:
+      RFS_LOGLEVEL: ${RFS_LOGLEVEL:-info}
+      RFS_LOGFORMAT: json
+      RFS_APPENDFSYNC: ${RFS_APPENDFSYNC:-everysec}
+    command:
+      - "-dir=/data"
+      - "-addr=:6379"
+      - "-metrics-addr=:9121"
+    restart: unless-stopped
+    # Bounded so that a runaway allocation is contained rather than taking the
+    # host's memory with it.
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "exec 3<>/dev/tcp/127.0.0.1/6379 && printf 'PING\\r\\n' >&3 && head -c 7 <&3 | grep -q PONG"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  engine:
+    build:
+      context: .
+    image: rfs:latest
+    container_name: rfs-engine
+    profiles: ["lsm"]
+    entrypoint: ["/usr/local/bin/rfs-engine"]
+    command:
+      - "--addr=0.0.0.0:50051"
+      - "--dir=/data"
+      - "--fsync=everysec"
+    volumes:
+      - engine-data:/data
+    expose:
+      - "50051"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  node-lsm:
+    build:
+      context: .
+    image: rfs:latest
+    container_name: rfs-node-lsm
+    profiles: ["lsm"]
+    depends_on:
+      - engine
+    ports:
+      - "6380:6379"
+      - "9122:9121"
+    environment:
+      RFS_ENGINE: lsm
+      RFS_ENGINE_ADDR: engine:50051
+      RFS_LOGFORMAT: json
+    command:
+      - "-addr=:6379"
+      - "-metrics-addr=:9121"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "exec 3<>/dev/tcp/127.0.0.1/6379 && printf 'PING\\r\\n' >&3 && head -c 7 <&3 | grep -q PONG"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  node-data:
+  engine-data:

@@ -1,6 +1,20 @@
-.git
-.idea
-.claude
-docs
-engine/target
+# Build output and local state: never send these to the daemon, and never let
+# a stale local artifact end up in an image.
+bin/
+data/
+engine-data/
+engine/target/
+*.test
+*.out
+
+# Version control and CI
+.git/
+.github/
+.idea/
+.vscode/
+
+# Docs and benchmarks are not needed to build a binary
+docs/
+scripts/
 *.md
+!README.md

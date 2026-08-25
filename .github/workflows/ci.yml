@@ -5,8 +5,21 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push supersedes an in-flight run on the same branch. CI that keeps
+# grinding through commits nobody is waiting for is CI that is slow when it
+# matters.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A crash in CI should produce a usable backtrace rather than one line.
+  RUST_BACKTRACE: 1
+
 jobs:
   go:
+    name: Go
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,30 +27,168 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
       - name: Build
         run: go build ./...
-      - name: Test (race detector)
-        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Every concurrent test runs under the race detector, and a finding fails
+      # the build. A data race that has not crashed yet is a bug that has not
+      # been noticed yet.
+      - name: Unit and integration tests
+        run: go test -race -count=1 ./internal/... ./cmd/...
+
+      - name: End-to-end tests
+        run: go test -race -count=1 -timeout 300s ./test/e2e/...
+
       - name: Lint
         uses: golangci/golangci-lint-action@v8
         with:
           version: latest
 
+  crash:
+    name: Crash recovery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # These spawn the real binary and kill it with SIGKILL, so they need the
+      # process to be built rather than linked into the test. They run without
+      # the race detector because the instrumentation changes the timing of the
+      # very writes being interrupted.
+      - name: Kill the server and verify what survived
+        run: go test -count=1 -timeout 900s ./test/crash/...
+
+  compat:
+    name: Redis compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install redis-server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server redis-tools
+          redis-server --version
+
+      # The same commands go to this server and to a real redis-server and the
+      # replies are compared byte for byte. Hand-written expectations encode
+      # what the author believes Redis does; this encodes what it actually does.
+      - name: Differential comparison against redis-server
+        run: go test -race -count=1 -timeout 300s ./test/compat/...
+
   rust:
+    name: Rust
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: engine
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine
+
       - name: Build
-        run: cargo build --locked
+        run: cargo build --locked --all-targets
+
       - name: Test
         run: cargo test --locked
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
       - name: Format check
         run: cargo fmt --check
+
+  proto:
+    name: Generated code is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      # Generated code is committed so that a clean checkout builds without
+      # protoc. This guards the other half of that bargain: the committed code
+      # must actually match the contract it was generated from.
+      - name: Regenerate and diff
+        run: make proto-check
+
+  integration:
+    name: Go server against the Rust engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install protoc and redis-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler redis-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Build both binaries
+        run: make build
+
+      # The two processes are only ever wired together at run time, so nothing
+      # else in CI would notice a broken contract between them.
+      - name: Drive the full stack and kill the engine
+        run: ./scripts/smoke-lsm.sh
+
+  docker:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t rfs:ci .
+      - name: Run it and check it answers
+        run: |
+          docker run -d --name rfs-ci -p 6379:6379 rfs:ci
+          for i in $(seq 1 30); do
+            if docker exec rfs-ci /usr/local/bin/rfs-server -version >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          sudo apt-get update && sudo apt-get install -y redis-tools
+          for i in $(seq 1 30); do
+            if [ "$(redis-cli -p 6379 PING 2>/dev/null)" = "PONG" ]; then
+              redis-cli -p 6379 SET ci works
+              [ "$(redis-cli -p 6379 GET ci)" = "works" ] || exit 1
+              docker logs rfs-ci
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs rfs-ci
+          exit 1
