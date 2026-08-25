@@ -1,0 +1,56 @@
+[
+  {
+    "label": "set P=1 fsync=always",
+    "workload": "set",
+    "distribution": "uniform",
+    "addr": "127.0.0.1:7501",
+    "connections": 50,
+    "pipeline": 1,
+    "key_space": 200000,
+    "value_bytes": 64,
+    "read_ratio": 0.5,
+    "started_at": "2026-08-25T19:52:06.606108+05:30",
+    "elapsed_seconds": 8.01232775,
+    "ops": 29758,
+    "reads": 0,
+    "writes": 29758,
+    "errors": 0,
+    "ops_per_sec": 3714.026800763361,
+    "latency_usec": {
+      "max": 61117.292,
+      "mean": 13454.355956751126,
+      "min": 3586.625,
+      "p50": 12124.16,
+      "p90": 18874.368,
+      "p95": 23068.672,
+      "p99": 33816.576,
+      "p99.9": 45088.768
+    },
+    "server": {
+      "aof_appends": "42446",
+      "aof_enabled": "1",
+      "aof_fsync_policy": "always",
+      "aof_fsyncs": "2088",
+      "aof_writes": "2176",
+      "connected_clients": "50",
+      "db0": "keys=27688,expires=0,avg_ttl=0",
+      "expired_keys": "0",
+      "keyspace_hits": "0",
+      "keyspace_misses": "0",
+      "pipeline_batches": "0",
+      "redis_version": "7.2.0-compatible",
+      "rfs_version": "0.3.0-dev+82aa12e",
+      "storage_engine": "memory+wal",
+      "total_commands_processed": "42447",
+      "used_memory_human": "11.24M",
+      "wal_unsynced_records": "0"
+    },
+    "client": {
+      "go_version": "go1.26.4",
+      "os": "darwin",
+      "arch": "arm64",
+      "num_cpu": 14,
+      "colocated_with_server": true
+    }
+  }
+]
