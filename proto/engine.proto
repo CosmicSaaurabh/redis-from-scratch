@@ -1,0 +1,200 @@
+// The contract between the Go server and the Rust storage engine.
+//
+// The boundary is gRPC over a local socket rather than cgo. cgo would put a
+// segfault in the storage engine inside the server's address space, make every
+// call cross the Go scheduler's boundary, and complicate the build for both
+// languages. A local gRPC hop costs tens of microseconds and buys a hard fault
+// boundary, two independently profileable processes, and a seam that already
+// works when the engine moves to another host.
+syntax = "proto3";
+
+package rfs.engine.v1;
+
+option go_package = "github.com/CosmicSaaurabh/redis-from-scratch/internal/enginepb;enginepb";
+
+// StorageEngine is the pluggable storage boundary as seen over the wire.
+//
+// It carries no Redis semantics. There is no INCR and no SET NX here, because
+// those are command-layer concerns; the engine offers reads, writes and an
+// ordered scan, and the server composes the rest. Keeping Redis out of this
+// interface is what lets the same engine sit behind something that is not
+// Redis later.
+service StorageEngine {
+  // Get reads one key.
+  rpc Get(GetRequest) returns (GetResponse);
+  // Put writes one key.
+  rpc Put(PutRequest) returns (PutResponse);
+  // Delete removes one key.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  // BatchWrite applies several mutations atomically with respect to recovery.
+  rpc BatchWrite(BatchWriteRequest) returns (BatchWriteResponse);
+  // Scan walks the keyspace in key order.
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  // FlushAll removes every key.
+  rpc FlushAll(FlushAllRequest) returns (FlushAllResponse);
+  // Sync forces acknowledged writes to stable storage.
+  rpc Sync(SyncRequest) returns (SyncResponse);
+  // Flush freezes the memtable and writes it out as an SSTable.
+  rpc Flush(FlushRequest) returns (FlushResponse);
+  // Compact runs compaction until every level is inside its budget.
+  rpc Compact(CompactRequest) returns (CompactResponse);
+  // Stats reports engine counters.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+// Record is a stored value and its absolute expiry.
+message Record {
+  // The value bytes.
+  bytes value = 1;
+  // Absolute expiry in Unix milliseconds, or zero for never.
+  //
+  // Absolute rather than relative is a durability requirement, not a style
+  // choice: a relative TTL replayed from a log hours after it was written would
+  // silently extend every key's life by the length of the outage.
+  int64 expire_at = 2;
+}
+
+// GetRequest asks for one key.
+message GetRequest {
+  bytes key = 1;
+  // Wall time the read is evaluated against, so expiry decisions come from the
+  // caller's clock rather than the engine's. With two processes involved, a
+  // single authoritative clock is the only way TTLs stay consistent.
+  int64 now_ms = 2;
+}
+
+// GetResponse carries the record, if the key is live.
+message GetResponse {
+  bool found = 1;
+  Record record = 2;
+}
+
+// PutRequest writes one key.
+message PutRequest {
+  bytes key = 1;
+  Record record = 2;
+}
+
+// PutResponse acknowledges a write.
+message PutResponse {
+  // The engine sequence number the write was assigned.
+  uint64 sequence = 1;
+}
+
+// DeleteRequest removes one key.
+message DeleteRequest {
+  bytes key = 1;
+  int64 now_ms = 2;
+}
+
+// DeleteResponse reports whether a live record was present.
+message DeleteResponse {
+  bool existed = 1;
+  uint64 sequence = 2;
+}
+
+// Mutation is one write in a batch.
+message Mutation {
+  bytes key = 1;
+  // Absent means delete.
+  Record record = 2;
+  bool delete = 3;
+}
+
+// BatchWriteRequest applies several mutations as one log record.
+message BatchWriteRequest {
+  repeated Mutation mutations = 1;
+}
+
+// BatchWriteResponse acknowledges a batch.
+message BatchWriteResponse {
+  uint64 sequence = 1;
+}
+
+// ScanRequest asks for a page of the keyspace.
+message ScanRequest {
+  // Resume from this key inclusive. Empty starts at the beginning.
+  bytes start = 1;
+  // Maximum records to return.
+  uint32 limit = 2;
+  int64 now_ms = 3;
+}
+
+// KeyValue is one scanned record.
+message KeyValue {
+  bytes key = 1;
+  Record record = 2;
+}
+
+// ScanResponse carries a page and where to resume.
+message ScanResponse {
+  repeated KeyValue entries = 1;
+  // Where the next page starts. Absent means the walk is finished.
+  bytes next_start = 2;
+  bool has_more = 3;
+}
+
+// FlushAllRequest removes every key.
+message FlushAllRequest {}
+
+// FlushAllResponse acknowledges the wipe.
+message FlushAllResponse {
+  uint64 keys_removed = 1;
+}
+
+// SyncRequest forces acknowledged writes to stable storage.
+message SyncRequest {}
+
+// SyncResponse acknowledges the fsync.
+message SyncResponse {}
+
+// FlushRequest writes the memtable out as an SSTable.
+message FlushRequest {}
+
+// FlushResponse acknowledges the flush.
+message FlushResponse {}
+
+// CompactRequest runs compaction to completion.
+message CompactRequest {}
+
+// CompactResponse acknowledges the compaction.
+message CompactResponse {}
+
+// StatsRequest asks for engine counters.
+message StatsRequest {
+  int64 now_ms = 1;
+}
+
+// StatsResponse reports engine counters.
+message StatsResponse {
+  // Live keys, estimated. Over-counts keys present at several levels and
+  // tombstones not yet compacted away; an exact count needs a full merge, which
+  // is why this is labelled an estimate everywhere it surfaces.
+  uint64 keys_estimate = 1;
+  uint64 disk_bytes = 2;
+  uint64 memory_bytes = 3;
+  repeated uint64 level_files = 4;
+  repeated uint64 level_bytes = 5;
+  uint64 writes = 6;
+  uint64 reads = 7;
+  uint64 flushes = 8;
+  uint64 compactions = 9;
+  uint64 compaction_bytes_read = 10;
+  uint64 compaction_bytes_written = 11;
+  uint64 write_stalls = 12;
+  uint64 bloom_rejections = 13;
+  uint64 sstable_reads = 14;
+  uint64 wal_appends = 15;
+  uint64 wal_writes = 16;
+  uint64 wal_fsyncs = 17;
+  uint64 wal_bytes = 18;
+  // Acknowledged records not yet on stable storage. This is the exact size of
+  // the window a power cut would lose.
+  uint64 wal_unsynced = 19;
+  string wal_policy = 20;
+  string version = 21;
+  // Set when the last recovery discarded an incomplete record from the end of
+  // the log. An operator must never have to infer that.
+  bool recovery_truncated = 22;
+  uint64 recovery_log_batches = 23;
+}

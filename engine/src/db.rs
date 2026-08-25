@@ -212,6 +212,8 @@ struct Inner {
     work_ready: Condvar,
     /// Signalled when level 0 shrinks, waking any stalled writer.
     space_available: Condvar,
+    /// When the background thread last honoured the everysec fsync.
+    last_periodic_sync: Mutex<Instant>,
 
     stopping: AtomicBool,
     /// Latches the first background failure. Once the engine cannot flush, it
@@ -299,6 +301,7 @@ impl Db {
             work: Mutex::new(false),
             work_ready: Condvar::new(),
             space_available: Condvar::new(),
+            last_periodic_sync: Mutex::new(Instant::now()),
             stopping: AtomicBool::new(false),
             fatal: Mutex::new(None),
             counters: Counters::default(),
@@ -826,9 +829,16 @@ impl Inner {
         // Every key currently visible is deleted by writing a tombstone for it.
         // Compaction reclaims the space; until then reads see the tombstones and
         // report the keys as gone, which is what matters.
+        //
+        // The scan runs at i64::MIN, not i64::MAX. It is tempting to read the
+        // latter as "see everything", but the scan resolves expiry against the
+        // clock it is given: at i64::MAX every key with a TTL looks expired and
+        // is skipped, so it never gets a tombstone, and it comes back to life
+        // on the next read against the real clock. i64::MIN makes nothing look
+        // expired, which is what "delete every key" actually needs.
         let mut start = Vec::new();
         loop {
-            let (page, next) = self.scan(&start, 10_000, i64::MAX)?;
+            let (page, next) = self.scan(&start, 10_000, i64::MIN)?;
             if !page.is_empty() {
                 let muts: Vec<Mutation> = page
                     .iter()
@@ -992,16 +1002,43 @@ impl Inner {
                 continue;
             }
 
+            // Idle: take the opportunity to honour the once-a-second fsync the
+            // everysec policy promises, and to push anything still buffered.
+            if let Err(e) = self.periodic_log_maintenance() {
+                self.poison(e.to_string());
+            }
+
             let mut w = self.work.lock().expect("work lock");
             if !*w {
                 let (g, _) = self
                     .work_ready
-                    .wait_timeout(w, Duration::from_millis(500))
+                    .wait_timeout(w, Duration::from_millis(250))
                     .expect("work condvar");
                 w = g;
             }
             *w = false;
         }
+    }
+
+    /// Flushes the log and, under the everysec policy, fsyncs it once a second.
+    ///
+    /// The write path already pushes bytes to the kernel before acknowledging,
+    /// so this is not what makes a process kill survivable. It is what bounds
+    /// what a power cut can take: without it, `everysec` would only fsync when
+    /// the buffer happened to overflow.
+    fn periodic_log_maintenance(&self) -> Result<()> {
+        let log = Arc::clone(&self.log.read().expect("log lock"));
+        log.flush()?;
+        if log.policy() != SyncPolicy::EverySecond {
+            return Ok(());
+        }
+        let mut last = self.last_periodic_sync.lock().expect("sync clock");
+        if last.elapsed() < Duration::from_secs(1) {
+            return Ok(());
+        }
+        log.sync_all()?;
+        *last = Instant::now();
+        Ok(())
     }
 
     fn do_background_step(&self) -> Result<bool> {

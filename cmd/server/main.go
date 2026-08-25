@@ -153,6 +153,7 @@ func openEngine(cfg *config.Config, clk clock.Clock, log *slog.Logger) (store.St
 		eng, err := lsm.Open(lsm.Options{
 			Addr:    cfg.EngineAddr,
 			Timeout: cfg.EngineTimeout,
+			Clock:   clk,
 			Logger:  log,
 		})
 		if err != nil {

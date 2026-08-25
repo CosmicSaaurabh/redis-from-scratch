@@ -589,3 +589,57 @@ fn bloom_filters_actually_prevent_block_reads() {
         "filters rejected {rejected} lookups but {read} still read a block; the filter is not earning its space"
     );
 }
+
+#[test]
+fn flush_all_removes_keys_that_have_a_ttl() {
+    // Regression: the wipe resolved expiry against i64::MAX, which made every
+    // key with a TTL look already expired. Those keys were skipped, never got a
+    // tombstone, and reappeared on the next read against the real clock.
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(small(&dir)).unwrap();
+
+    let now = 1_700_000_000_000i64;
+    db.put(b"plain".to_vec(), b"v".to_vec(), 0).unwrap();
+    db.put(b"with-ttl".to_vec(), b"v".to_vec(), now + 3_600_000)
+        .unwrap();
+    db.put(b"far-future".to_vec(), b"v".to_vec(), i64::MAX)
+        .unwrap();
+    db.flush_memtable().unwrap();
+
+    db.flush_all().unwrap();
+
+    for k in [&b"plain"[..], b"with-ttl", b"far-future"] {
+        assert!(
+            db.get(k, now).unwrap().is_none(),
+            "{} survived FLUSHALL",
+            String::from_utf8_lossy(k)
+        );
+    }
+    // And it must stay gone across a flush and a compaction, which is where a
+    // missing tombstone would let the old value resurface.
+    db.flush_memtable().unwrap();
+    db.compact_all().unwrap();
+    for k in [&b"plain"[..], b"with-ttl", b"far-future"] {
+        assert!(
+            db.get(k, now).unwrap().is_none(),
+            "{} came back after compaction",
+            String::from_utf8_lossy(k)
+        );
+    }
+    assert_eq!(db.exact_len(now).unwrap(), 0);
+}
+
+#[test]
+fn flush_all_then_write_again_works() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(small(&dir)).unwrap();
+    for i in 0..500 {
+        db.put(key(i), val(i), 0).unwrap();
+    }
+    db.flush_all().unwrap();
+    assert_eq!(db.exact_len(0).unwrap(), 0);
+
+    db.put(b"after".to_vec(), b"wipe".to_vec(), 0).unwrap();
+    assert_eq!(get_str(&db, b"after"), Some("wipe".to_string()));
+    assert_eq!(db.exact_len(0).unwrap(), 1);
+}

@@ -7,6 +7,7 @@ pub mod db;
 pub mod error;
 pub mod manifest;
 pub mod memtable;
+pub mod service;
 pub mod sstable;
 pub mod types;
 pub mod wal;

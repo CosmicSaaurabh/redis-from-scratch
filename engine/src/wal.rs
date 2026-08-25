@@ -297,11 +297,19 @@ impl Wal {
         self.sync_locked(&mut f)
     }
 
-    /// Applies the configured policy after a write.
+    /// Applies the configured policy after a write, before it is acknowledged.
+    ///
+    /// Under `EverySecond` this still pushes the bytes to the kernel. That is
+    /// the whole difference between the policy's two failure modes: the page
+    /// cache outlives the process, so killing the engine loses nothing, while
+    /// only a power cut - which the once-a-second fsync bounds to one second -
+    /// can lose anything. Skipping this write would leave acknowledged records
+    /// sitting in this process's memory, where a plain kill destroys them.
     pub fn commit(&self, seq: u64) -> Result<()> {
         match self.policy {
             SyncPolicy::Always => self.sync_to(seq),
-            _ => Ok(()),
+            SyncPolicy::EverySecond => self.flush(),
+            SyncPolicy::Never => Ok(()),
         }
     }
 
