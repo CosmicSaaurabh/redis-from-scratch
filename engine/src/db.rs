@@ -1186,7 +1186,21 @@ impl Inner {
             man.last_sequence = man.last_sequence.max(frozen.table.len() as u64);
             man.store(&self.opts.dir)?;
         }
-        *self.version.write().expect("version lock") = new_version;
+        let superseded = {
+            let mut g = self.version.write().expect("version lock");
+            std::mem::replace(&mut *g, new_version)
+        };
+        // A flush retires no files, but it still supersedes a version, and a
+        // reader may be holding it. Parking it with an empty file list keeps
+        // the chain of superseded versions unbroken, which is what lets the
+        // sweep below reason about the oldest one still in use.
+        self.pending_deletes
+            .lock()
+            .expect("pending deletes")
+            .push(PendingDelete {
+                version: superseded,
+                files: Vec::new(),
+            });
 
         self.retire_frozen(frozen.log_number)?;
         self.counters.flushes.fetch_add(1, Ordering::Relaxed);
@@ -1538,12 +1552,25 @@ impl Inner {
 
     /// Unlinks superseded files once no reader can still reach them.
     ///
-    /// A version becomes unreachable the moment a newer one is installed, so
-    /// from then on its reference count only falls. A count of one means the
-    /// only remaining holder is this list, and the files it named can go.
+    /// Versions form a chain, and the list below is in install order. A reader
+    /// holding some version needs every file that version names, and a file
+    /// retired at a later point was also present at an earlier one, so the
+    /// sweep walks the list from the oldest end and stops at the first version
+    /// anything is still holding. Everything after it stays, which is
+    /// conservative - a few files linger a little longer than strictly
+    /// necessary - and being conservative here is the difference between a
+    /// delayed reclaim and a read that fails.
+    ///
+    /// Checking only the version being superseded is not enough, and was the
+    /// first attempt: a reader can be holding a version two installs back that
+    /// names the very files the newest install is retiring.
+    ///
+    /// Once a newer version is installed no reader can obtain an older one, so
+    /// a strong count of one means this list is the last holder and can never
+    /// gain another.
     ///
     /// On a POSIX system a file already open stays readable after being
-    /// unlinked, so this only has to cover the window before a reader opens it -
+    /// unlinked, so this only has to cover the window before a reader opens it,
     /// which is exactly the window in which a cache miss would try to open a
     /// path that no longer exists.
     fn sweep_pending_deletes(&self) -> Result<()> {
@@ -1551,30 +1578,32 @@ impl Inner {
         if pending.is_empty() {
             return Ok(());
         }
-        let mut still_referenced = Vec::with_capacity(pending.len());
-        let mut removed = 0usize;
-        for p in std::mem::take(&mut *pending) {
+
+        let mut releasable = 0usize;
+        for p in pending.iter() {
             if Arc::strong_count(&p.version) > 1 {
-                still_referenced.push(p);
-                continue;
+                break;
             }
+            releasable += 1;
+        }
+        if releasable == 0 {
+            return Ok(());
+        }
+
+        let retiring: Vec<PendingDelete> = pending.drain(..releasable).collect();
+        drop(pending);
+
+        let mut removed = 0usize;
+        for p in &retiring {
             for n in &p.files {
                 let path = self.opts.dir.join(format!("{n:012}.sst"));
                 match std::fs::remove_file(&path) {
                     Ok(()) => removed += 1,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        // Put the rest back so a transient failure does not
-                        // leak the remaining files forever.
-                        still_referenced.push(p);
-                        *pending = still_referenced;
-                        return Err(Error::io(&path, e));
-                    }
+                    Err(e) => return Err(Error::io(&path, e)),
                 }
             }
         }
-        *pending = still_referenced;
-        drop(pending);
         if removed > 0 {
             wal::sync_dir(&self.opts.dir)?;
         }

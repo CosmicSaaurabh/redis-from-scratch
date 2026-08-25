@@ -12,14 +12,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Writer threads yield between operations and stop after a bounded number of
-/// them.
+/// A safety cap so a writer thread terminates even if its reader dies.
 ///
-/// An unbounded tight loop pins a core, and on a two-core CI runner three such
-/// tests in parallel starve the engine's background thread badly enough to look
-/// like a hang. The point of these tests is that background work runs
-/// *concurrently* with a read, not that it runs at maximum possible rate.
-const WRITER_BUDGET: usize = 20_000;
+/// The reader decides when each test ends, not the writer. Making the writer
+/// stop after a fixed count instead was a mistake: on a fast machine it
+/// finished before the reader had done any meaningful work, and the test's own
+/// coverage assertion fired. Writers also yield between operations, because an
+/// unbounded tight loop pins a core and three of these in parallel on a
+/// two-core runner starve the engine's background thread.
+const WRITER_SAFETY_CAP: usize = 400_000;
 
 use engine::db::{Db, Options};
 use engine::wal::SyncPolicy;
@@ -135,58 +136,56 @@ fn reading_while_compacting_never_hits_a_deleted_file() {
     // snapshot of that version would then open a file that is no longer there
     // and report an I/O error for a perfectly valid read.
     //
-    // The reader must be running *while* compactions install and retire files,
-    // so the database is pre-filled to guarantee there is already a tree to
-    // compact, and the reader loops until the writer has finished its budget.
+    // The reader has to be running *while* compactions install and retire
+    // files, so the tree is pre-filled to guarantee there is something to
+    // compact, and the reader - not the writer - decides when the test ends.
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Db::open(opts(&dir)).unwrap());
     fill(&db, 3_000);
 
-    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     let writer = {
-        let (db, done) = (Arc::clone(&db), Arc::clone(&done));
+        let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
         std::thread::spawn(move || {
             // Rewriting one key space over and over is what keeps compaction
             // continuously producing and retiring files.
-            for i in 0..WRITER_BUDGET {
+            let mut i = 0usize;
+            while !stop.load(Ordering::Relaxed) && i < WRITER_SAFETY_CAP {
                 db.put(
                     format!("key:{:08}", i % 3_000).into_bytes(),
                     format!("v{i}{}", "y".repeat(30)).into_bytes(),
                     0,
                 )
                 .unwrap();
-                if i % 64 == 0 {
-                    std::thread::yield_now();
-                }
+                i += 1;
+                std::thread::yield_now();
             }
-            done.store(true, Ordering::Release);
         })
     };
 
-    let mut reads = 0usize;
-    while !done.load(Ordering::Acquire) {
-        let k = format!("key:{:08}", reads % 3_000);
+    for read in 0..120 {
+        let k = format!("key:{:08}", read % 3_000);
         db.get(k.as_bytes(), 0)
-            .unwrap_or_else(|e| panic!("point read {reads} failed while compaction ran: {e}"));
+            .unwrap_or_else(|e| panic!("point read {read} failed while compaction ran: {e}"));
 
         let mut start = Vec::new();
         for page in 0..4 {
             let (_, next) = db.scan(&start, 128, 0).unwrap_or_else(|e| {
-                panic!("scan page {page} of read {reads} failed while compaction ran: {e}")
+                panic!("scan page {page} of read {read} failed while compaction ran: {e}")
             });
             match next {
                 Some(k) => start = k,
                 None => break,
             }
         }
-        reads += 1;
     }
+
+    stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
 
-    assert!(
-        reads > 50,
-        "only {reads} reads overlapped the writer; the test proved nothing"
-    );
+    // The coverage check is that compaction actually ran, not that some number
+    // of reads happened: a read count depends on how fast the machine is, and
+    // asserting on it is what made this test fail in CI for no real reason.
     let stats = db.stats(0).unwrap();
     assert!(
         stats.compactions > 0,
