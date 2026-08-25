@@ -18,6 +18,10 @@ This is a deliberate learning project built entirely by hand to master the hard 
 
 ## Repository Layout
 
+- `cmd/server/`: the server entrypoint.
+- `internal/`: Go packages - RESP protocol, command dispatch, keyspace, WAL, Raft.
+- `engine/`: the Rust storage engine crate.
+- `proto/`: protobuf contracts for the Go-to-Rust boundary and inter-node RPC.
 - `docs/`: PRDs, high-level designs, low-level designs, ADRs, task breakdown, and the learning log.
 - `docs/tasks/mvp-task-breakdown.md`: the phased plan with definitions of done and edge cases.
 - `CLAUDE.md`: rules of engagement for the AI architect/reviewer guiding this project.

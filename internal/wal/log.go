@@ -125,8 +125,14 @@ type Log struct {
 	segSeq  uint64
 	segLen  int64
 
-	writtenLSN atomic.Uint64
-	syncedLSN  atomic.Uint64
+	// lastAppended mirrors nextLSN-1 outside the mutex so that Flush and Sync
+	// can answer "there is nothing to do" without touching a lock at all.
+	// Read-only workloads call Flush once per pipeline batch, and making 50
+	// connections queue on a mutex to each discover an empty buffer was
+	// measurably more expensive than the write it was trying to batch.
+	lastAppended atomic.Uint64
+	writtenLSN   atomic.Uint64
+	syncedLSN    atomic.Uint64
 
 	appends  atomic.Uint64
 	fsyncs   atomic.Uint64
@@ -194,6 +200,7 @@ func Open(opt Options, startLSN uint64) (*Log, error) {
 		segSeq:  nextSeq,
 		stop:    make(chan struct{}),
 	}
+	l.lastAppended.Store(startLSN)
 	l.writtenLSN.Store(startLSN)
 	l.syncedLSN.Store(startLSN)
 
@@ -265,6 +272,7 @@ func (l *Log) append(typ RecordType, encode func([]byte) []byte) (uint64, error)
 	l.nextLSN++
 	l.buf = appendRecord(l.buf, typ, lsn, payload)
 	overflow := len(l.buf) >= l.opt.MaxBufferBytes
+	l.lastAppended.Store(lsn)
 	l.mu.Unlock()
 
 	*sp = payload[:0]
@@ -290,8 +298,17 @@ func (l *Log) Flush() error {
 	if l.closed.Load() {
 		return store.ErrClosed
 	}
+	if l.lastAppended.Load() <= l.writtenLSN.Load() {
+		return nil
+	}
 	l.flushMu.Lock()
 	defer l.flushMu.Unlock()
+	// Re-check under the gate. Between the fast path above and acquiring the
+	// lock another goroutine may already have written these records, and this
+	// is where that turns into a skipped syscall rather than an empty one.
+	if l.lastAppended.Load() <= l.writtenLSN.Load() {
+		return nil
+	}
 	_, err := l.drainLocked()
 	return err
 }

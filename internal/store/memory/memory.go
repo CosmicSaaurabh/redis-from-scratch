@@ -109,12 +109,14 @@ func (s *Store) Get(ctx context.Context, key []byte) (store.Record, bool, error)
 
 	sh.mu.RLock()
 	rec, ok := sh.m[string(key)]
-	if ok && !rec.Expired(now) {
-		out := rec.Clone()
-		sh.mu.RUnlock()
-		return out, true, nil
-	}
 	sh.mu.RUnlock()
+	if ok && !rec.Expired(now) {
+		// Returned without copying. Stored values are immutable: putLocked
+		// installs a fresh copy and nothing ever writes through an installed
+		// slice, so handing the caller a read-only alias is safe and takes a
+		// per-GET allocation off the hot path.
+		return rec, true, nil
+	}
 	if !ok {
 		return store.Record{}, false, nil
 	}
@@ -309,7 +311,9 @@ func (s *Store) Scan(ctx context.Context, cursor uint64, count int, fn func(key 
 			if rec.Expired(now) {
 				continue
 			}
-			batch = append(batch, scanned{key: []byte(k), rec: rec.Clone()})
+			// The key must be copied because it is a map key string, but the
+			// value is immutable and can be aliased.
+			batch = append(batch, scanned{key: []byte(k), rec: rec})
 		}
 		sh.mu.RUnlock()
 

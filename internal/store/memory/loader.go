@@ -86,7 +86,7 @@ func (s *Store) ForEach(fn func(key []byte, rec store.Record) bool) {
 		sh.mu.RLock()
 		batch := make([]scanned, 0, len(sh.m))
 		for k, rec := range sh.m {
-			batch = append(batch, scanned{key: []byte(k), rec: rec.Clone()})
+			batch = append(batch, scanned{key: []byte(k), rec: rec})
 		}
 		sh.mu.RUnlock()
 		for _, e := range batch {

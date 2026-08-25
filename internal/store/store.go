@@ -83,11 +83,21 @@ type Mutation struct {
 
 // Store is the persistence engine contract.
 //
-// All methods are safe for concurrent use. Key and value slices passed in are
-// borrowed for the duration of the call only; implementations copy what they
-// retain. Slices returned from Get and Scan are owned by the caller and are
-// safe to hold, because the cost of one copy on the read path is far cheaper
-// than the class of aliasing bug the alternative invites.
+// All methods are safe for concurrent use.
+//
+// Ownership rules, which are the whole reason the read path allocates nothing:
+//
+//   - Slices passed in are borrowed for the duration of the call. An engine
+//     that retains a key or value copies it.
+//   - Slices returned from Get and Scan are READ-ONLY and must never be
+//     modified by the caller. They may alias engine-owned memory. They stay
+//     valid indefinitely - a stored value is immutable once written, and an
+//     overwrite replaces the whole record rather than editing it in place - so
+//     a caller may hold one, it simply may not write through it.
+//
+// Copying on the read path would be the safer-looking choice, and it is what
+// this interface did first. It also meant one allocation and one memcpy on
+// every GET for a value nothing was ever going to modify.
 type Store interface {
 	// Name identifies the engine for INFO and metrics.
 	Name() string

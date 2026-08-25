@@ -241,3 +241,30 @@ func sanitizeLine(s string) string {
 	}
 	return s
 }
+
+// Command values used by ReplyReader for the RESP3 double spellings.
+var (
+	posInf = math.Inf(1)
+	negInf = math.Inf(-1)
+	nan    = math.NaN()
+)
+
+// WriteCommand encodes a command as a multibulk request. It is the client-side
+// counterpart of Reader.ReadCommand and is used by the benchmark harness and
+// the end-to-end tests.
+func (w *Writer) WriteCommand(args ...[]byte) {
+	w.WriteArrayHeader(len(args))
+	for _, a := range args {
+		w.writeHeader(TypeBulkString, int64(len(a)))
+		_, _ = w.bw.Write(a)
+		_, _ = w.bw.Write(crlf)
+	}
+}
+
+// WriteCommandStrings is WriteCommand for string arguments.
+func (w *Writer) WriteCommandStrings(args ...string) {
+	w.WriteArrayHeader(len(args))
+	for _, a := range args {
+		w.WriteBulkString(a)
+	}
+}

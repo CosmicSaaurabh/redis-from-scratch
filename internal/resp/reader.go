@@ -69,6 +69,9 @@ type Reader struct {
 	lim   Limits
 	args  [][]byte
 	block []byte
+	// inFlight is true between consuming a command's first byte and returning
+	// it, so a caller can distinguish an idle timeout from a partial frame.
+	inFlight bool
 }
 
 // NewReader wraps rd. A zero-valued lim is replaced by DefaultLimits.
@@ -98,13 +101,19 @@ func (r *Reader) Buffered() int { return r.br.Buffered() }
 func (r *Reader) ReadCommand() ([][]byte, error) {
 	r.args = r.args[:0]
 	r.block = r.block[:0]
+	r.inFlight = false
 
 	prefix, err := r.br.Peek(1)
 	if err != nil {
 		return nil, err
 	}
+	r.inFlight = true
 	if prefix[0] != TypeArray {
-		return r.readInline()
+		args, err := r.readInline()
+		if err == nil {
+			r.inFlight = false
+		}
+		return args, err
 	}
 	if _, err := r.br.Discard(1); err != nil {
 		return nil, err
@@ -118,8 +127,10 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 	case n < 0:
 		// A null multibulk from a client is not meaningful; treat it as a no-op
 		// rather than dropping the connection.
+		r.inFlight = false
 		return nil, nil
 	case n == 0:
+		r.inFlight = false
 		return nil, nil
 	case n > r.lim.MaxMultiBulkLen:
 		return nil, protoErrf("invalid multibulk length")
@@ -135,6 +146,7 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 		}
 		r.args = append(r.args, arg)
 	}
+	r.inFlight = false
 	return r.args, nil
 }
 
@@ -303,3 +315,91 @@ func parseInt(b []byte) (int64, bool) {
 // which need the same "strict decimal, no leading zeros tolerance" semantics
 // Redis applies to arguments like EXPIRE seconds.
 func ParseInt(b []byte) (int64, bool) { return parseInt(b) }
+
+// InFlight reports whether the reader stopped part-way through a command.
+//
+// The server uses it to tell two very different timeouts apart. A read
+// deadline that fires with nothing in flight is a healthy idle client and the
+// connection should survive. One that fires mid-command is a client that sent
+// a partial frame and stopped, which is a slowloris: it costs a goroutine and
+// a buffer for as long as it is tolerated, so the connection is dropped.
+func (r *Reader) InFlight() bool { return r.inFlight }
+
+// HasCompleteCommand reports whether a whole command is already buffered.
+//
+// This is what makes reply batching safe. A server that keeps reading while
+// any bytes are buffered can block mid-frame while holding replies the client
+// is waiting for, and the two sides deadlock until a timeout breaks it. By
+// only continuing the batch when a complete command is already in memory, the
+// server can never block with an unflushed reply.
+//
+// It parses framing without consuming anything and never allocates.
+func (r *Reader) HasCompleteCommand() bool {
+	n := r.br.Buffered()
+	if n == 0 {
+		return false
+	}
+	buf, err := r.br.Peek(n)
+	if err != nil {
+		return false
+	}
+	if buf[0] != TypeArray {
+		// An inline command is complete once a newline is present.
+		for _, b := range buf {
+			if b == '\n' {
+				return true
+			}
+		}
+		return false
+	}
+
+	count, rest, ok := peekCount(buf[1:])
+	if !ok {
+		return false
+	}
+	if count <= 0 {
+		return true
+	}
+	if count > r.lim.MaxMultiBulkLen {
+		// Over the limit, so the next real read will reject it. Reporting the
+		// command as complete lets that rejection happen promptly instead of
+		// stalling until a timeout.
+		return true
+	}
+	for i := 0; i < count; i++ {
+		if len(rest) == 0 || rest[0] != TypeBulkString {
+			return len(rest) > 0 // malformed: let the real reader produce the error
+		}
+		size, tail, ok := peekCount(rest[1:])
+		if !ok {
+			return false
+		}
+		if size < 0 || int64(size) > r.lim.MaxBulkSize {
+			return true
+		}
+		if len(tail) < size+2 {
+			return false
+		}
+		rest = tail[size+2:]
+	}
+	return true
+}
+
+// peekCount reads a CRLF-terminated integer from buf without consuming it.
+func peekCount(buf []byte) (n int, rest []byte, ok bool) {
+	for i := 0; i+1 < len(buf); i++ {
+		if buf[i] != '\r' || buf[i+1] != '\n' {
+			continue
+		}
+		v, valid := parseInt(buf[:i])
+		if !valid {
+			// Malformed, but fully framed: the real reader will reject it.
+			return 0, buf[i+2:], true
+		}
+		if v > int64(^uint(0)>>1) || v < -int64(^uint(0)>>1) {
+			return 0, buf[i+2:], true
+		}
+		return int(v), buf[i+2:], true
+	}
+	return 0, nil, false
+}
