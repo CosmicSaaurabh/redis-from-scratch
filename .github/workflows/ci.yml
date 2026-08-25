@@ -93,6 +93,9 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    # A storage engine test that deadlocks would otherwise sit here for six
+    # hours. Failing in ten minutes is the useful outcome.
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: engine

@@ -12,6 +12,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Writer threads yield between operations and stop after a bounded number of
+/// them.
+///
+/// An unbounded tight loop pins a core, and on a two-core CI runner three such
+/// tests in parallel starve the engine's background thread badly enough to look
+/// like a hang. The point of these tests is that background work runs
+/// *concurrently* with a read, not that it runs at maximum possible rate.
+const WRITER_BUDGET: usize = 20_000;
+
 use engine::db::{Db, Options};
 use engine::wal::SyncPolicy;
 use tempfile::TempDir;
@@ -122,45 +131,65 @@ fn scanning_while_writing_never_sees_a_key_disappear() {
 
 #[test]
 fn reading_while_compacting_never_hits_a_deleted_file() {
-    // Compaction deletes a file only after installing the version that stops
-    // naming it. A reader holding a stale snapshot would open a file that is
-    // no longer there and report an I/O error for a perfectly valid read.
+    // Compaction unlinks the files a version stops naming. A reader holding a
+    // snapshot of that version would then open a file that is no longer there
+    // and report an I/O error for a perfectly valid read.
+    //
+    // The reader must be running *while* compactions install and retire files,
+    // so the database is pre-filled to guarantee there is already a tree to
+    // compact, and the reader loops until the writer has finished its budget.
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Db::open(opts(&dir)).unwrap());
+    fill(&db, 3_000);
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     let writer = {
-        let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
+        let (db, done) = (Arc::clone(&db), Arc::clone(&done));
         std::thread::spawn(move || {
-            let mut i = 0usize;
-            while !stop.load(Ordering::Relaxed) {
-                // Rewriting the same key space keeps compaction busy.
+            // Rewriting one key space over and over is what keeps compaction
+            // continuously producing and retiring files.
+            for i in 0..WRITER_BUDGET {
                 db.put(
-                    format!("key:{:08}", i % 1_500).into_bytes(),
+                    format!("key:{:08}", i % 3_000).into_bytes(),
                     format!("v{i}{}", "y".repeat(30)).into_bytes(),
                     0,
                 )
                 .unwrap();
-                i += 1;
+                if i % 64 == 0 {
+                    std::thread::yield_now();
+                }
             }
+            done.store(true, Ordering::Release);
         })
     };
 
-    for attempt in 0..150 {
-        db.get(format!("key:{:08}", attempt % 1_500).as_bytes(), 0)
-            .unwrap_or_else(|e| panic!("attempt {attempt}: point read failed: {e}"));
+    let mut reads = 0usize;
+    while !done.load(Ordering::Acquire) {
+        let k = format!("key:{:08}", reads % 3_000);
+        db.get(k.as_bytes(), 0)
+            .unwrap_or_else(|e| panic!("point read {reads} failed while compaction ran: {e}"));
+
         let mut start = Vec::new();
-        for _ in 0..5 {
-            let (_, next) = db
-                .scan(&start, 100, 0)
-                .unwrap_or_else(|e| panic!("attempt {attempt}: scan failed: {e}"));
+        for page in 0..4 {
+            let (_, next) = db.scan(&start, 128, 0).unwrap_or_else(|e| {
+                panic!("scan page {page} of read {reads} failed while compaction ran: {e}")
+            });
             match next {
                 Some(k) => start = k,
                 None => break,
             }
         }
+        reads += 1;
     }
-
-    stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
+
+    assert!(
+        reads > 50,
+        "only {reads} reads overlapped the writer; the test proved nothing"
+    );
+    let stats = db.stats(0).unwrap();
+    assert!(
+        stats.compactions > 0,
+        "no compaction ran, so no file was ever retired under a reader"
+    );
 }

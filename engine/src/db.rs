@@ -203,6 +203,9 @@ struct Inner {
     tables: RwLock<HashMap<u64, Arc<SsTable>>>,
     /// Makes flush and compaction single-flight.
     compaction: Mutex<()>,
+    /// Files a compaction has superseded but which an in-flight reader may
+    /// still be about to open. See [`Inner::sweep_pending_deletes`].
+    pending_deletes: Mutex<Vec<PendingDelete>>,
     /// Where the last compaction of each level stopped, so repeated
     /// compactions rotate across the key space instead of rewriting the same
     /// file over and over.
@@ -300,6 +303,7 @@ impl Db {
             manifest: Mutex::new(manifest),
             tables: RwLock::new(HashMap::new()),
             compaction: Mutex::new(()),
+            pending_deletes: Mutex::new(Vec::new()),
             compact_pointer: Mutex::new(HashMap::new()),
             work: Mutex::new(false),
             work_ready: Condvar::new(),
@@ -645,11 +649,12 @@ impl Inner {
             }
         }
 
-        // Held rather than cloned: compaction deletes a file only after
-        // installing the version that stops naming it, so holding a read guard
-        // for the duration of the lookup is what stops this read from opening a
-        // file that is being removed underneath it.
-        let version = self.version.read().expect("version lock");
+        // Cloned, not held. Holding the read guard across the file reads would
+        // stop compaction from ever installing a new version while reads are in
+        // flight, which on a busy two-core machine starves the background
+        // thread outright. The files this snapshot names are kept alive by
+        // deferred deletion instead; see sweep_pending_deletes.
+        let version = Arc::clone(&self.version.read().expect("version lock"));
         for f in version.level(0) {
             if let Some(answer) = self.lookup_file(f, key, now_ms)? {
                 return Ok(answer);
@@ -735,28 +740,27 @@ impl Inner {
             }
         }
 
-        // The version is held for the whole scan, and the memtables are read
-        // while holding it. Both halves matter.
+        // The version and the memtables are captured at one instant, under both
+        // read locks, and both locks are released before any file is touched.
         //
-        // Reading the version and the memtables at two different instants is a
-        // silent data-loss bug: a flush moves records out of a memtable and
-        // into a new version, so a reader that snapshots the version first and
-        // the memtables second can observe a moment where the flushed records
-        // are in neither. They do not come back as an error - they come back as
-        // the *older* value the flushed records were shadowing, which after a
-        // FLUSHALL means deleted keys returning to life.
+        // Capturing them at two different instants is a silent data-loss bug: a
+        // flush moves records out of a memtable and into a new version, so a
+        // reader that snapshots the version first and the memtables second can
+        // observe a moment where the flushed records are in neither. They do
+        // not come back as an error - they come back as the *older* values
+        // those records were shadowing, which after a FLUSHALL means deleted
+        // keys returning to life.
         //
-        // Holding the version also keeps compaction from deleting a file this
-        // scan is about to open, which otherwise surfaces as a spurious
-        // "no such file" in the middle of a perfectly valid read.
-        let version = self.version.read().expect("version lock");
-
-        // Memtable contents are copied out now, at the same instant as the
-        // version, but applied last, because they are newer than every file.
-        let mut newest: std::collections::BTreeMap<Vec<u8>, Option<Record>> =
-            std::collections::BTreeMap::new();
-        {
+        // Releasing before the file reads matters just as much. Holding the
+        // version guard across I/O blocks every version install, and a busy
+        // reader on a two-core machine starves the background thread outright.
+        // The files this snapshot names stay readable because compaction defers
+        // unlinking them; see sweep_pending_deletes.
+        let (version, newest) = {
+            let v = self.version.read().expect("version lock");
             let m = self.mem.read().expect("memtable lock");
+            let mut newest: std::collections::BTreeMap<Vec<u8>, Option<Record>> =
+                std::collections::BTreeMap::new();
             for fz in m.immutable.iter().rev() {
                 note(
                     collect_from_memtable(&fz.table, start, take, now_ms, &mut newest),
@@ -767,7 +771,8 @@ impl Inner {
                 collect_from_memtable(&m.active, start, take, now_ms, &mut newest),
                 &mut boundary,
             );
-        }
+            (Arc::clone(&v), newest)
+        };
 
         // Files, oldest source first, so newer ones overwrite.
         for level in (1..version.level_count()).rev() {
@@ -784,8 +789,6 @@ impl Inner {
                 &mut boundary,
             );
         }
-        drop(version);
-
         // Memtables win over every file.
         for (k, v) in newest {
             merged.insert(k, v);
@@ -1073,10 +1076,16 @@ impl Inner {
                 continue;
             }
 
-            // Idle: take the opportunity to honour the once-a-second fsync the
-            // everysec policy promises, and to push anything still buffered.
+            // Idle: honour the once-a-second fsync the everysec policy
+            // promises, push anything still buffered, and retire any files
+            // whose last reader has finished with them.
             if let Err(e) = self.periodic_log_maintenance() {
                 self.poison(e.to_string());
+            }
+            if let Err(e) = self.sweep_pending_deletes() {
+                // Not fatal: the data is safe and the manifest is correct, this
+                // is only disk that will be reclaimed on a later sweep.
+                tracing::warn!(error = %e, "could not retire superseded sstables");
             }
 
             let mut w = self.work.lock().expect("work lock");
@@ -1493,11 +1502,18 @@ impl Inner {
             man.version = (*new_version).clone();
             man.store(&self.opts.dir)?;
         }
-        *self.version.write().expect("version lock") = new_version;
+        let superseded = {
+            let mut g = self.version.write().expect("version lock");
+            std::mem::replace(&mut *g, new_version)
+        };
 
         // Only after the manifest no longer names them can the input files be
         // removed. Reversing this is the classic way to build an engine that
         // loses a level on exactly one unlucky reboot.
+        //
+        // "After" is not "immediately", though: a reader may be holding the
+        // version that still names these files. They are parked with that
+        // version and unlinked once nothing can reach it.
         let retired: Vec<u64> = plan
             .inputs
             .iter()
@@ -1510,15 +1526,58 @@ impl Inner {
                 cache.remove(n);
             }
         }
-        for n in &retired {
-            let path = self.opts.dir.join(format!("{n:012}.sst"));
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(Error::io(&path, e)),
+        self.pending_deletes
+            .lock()
+            .expect("pending deletes")
+            .push(PendingDelete {
+                version: superseded,
+                files: retired,
+            });
+        self.sweep_pending_deletes()
+    }
+
+    /// Unlinks superseded files once no reader can still reach them.
+    ///
+    /// A version becomes unreachable the moment a newer one is installed, so
+    /// from then on its reference count only falls. A count of one means the
+    /// only remaining holder is this list, and the files it named can go.
+    ///
+    /// On a POSIX system a file already open stays readable after being
+    /// unlinked, so this only has to cover the window before a reader opens it -
+    /// which is exactly the window in which a cache miss would try to open a
+    /// path that no longer exists.
+    fn sweep_pending_deletes(&self) -> Result<()> {
+        let mut pending = self.pending_deletes.lock().expect("pending deletes");
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut still_referenced = Vec::with_capacity(pending.len());
+        let mut removed = 0usize;
+        for p in std::mem::take(&mut *pending) {
+            if Arc::strong_count(&p.version) > 1 {
+                still_referenced.push(p);
+                continue;
+            }
+            for n in &p.files {
+                let path = self.opts.dir.join(format!("{n:012}.sst"));
+                match std::fs::remove_file(&path) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        // Put the rest back so a transient failure does not
+                        // leak the remaining files forever.
+                        still_referenced.push(p);
+                        *pending = still_referenced;
+                        return Err(Error::io(&path, e));
+                    }
+                }
             }
         }
-        wal::sync_dir(&self.opts.dir)?;
+        *pending = still_referenced;
+        drop(pending);
+        if removed > 0 {
+            wal::sync_dir(&self.opts.dir)?;
+        }
         Ok(())
     }
 
@@ -1533,6 +1592,19 @@ impl Inner {
         (level + 1..version.level_count())
             .any(|l| version.level(l).iter().any(|f| f.may_contain(key)))
     }
+}
+
+/// Files a compaction superseded, held back until nothing can still read them.
+///
+/// Unlinking a file the moment the manifest stops naming it is not safe: a
+/// reader may already hold a snapshot of the previous version and be about to
+/// open one of those files. Keeping the superseded version alongside them makes
+/// the question answerable, because once the new version is installed no reader
+/// can obtain the old one, so its reference count can only fall.
+#[derive(Debug)]
+struct PendingDelete {
+    version: Arc<Version>,
+    files: Vec<u64>,
 }
 
 /// One compaction's inputs.

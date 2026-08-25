@@ -147,7 +147,7 @@ no error, no crash, just wrong answers later:
 | bug | why it mattered |
 |---|---|
 | the LSM scan read the version and the memtables at **different instants** | a flush landing in that gap moved records out of the memtables and into a version the reader was not looking at, so they were in neither — and the scan returned the *older* values they had been shadowing. After a `FLUSHALL` that meant **383 deleted keys coming back to life** |
-| the LSM scan opened files compaction had already deleted | a valid read failed with "no such file" because the reader held a stale version snapshot |
+| the LSM scan opened files compaction had already deleted | a valid read failed with "no such file" because the reader held a stale version snapshot. Superseded files are now unlinked only once no live snapshot can still name them |
 | `FLUSHALL` scanned at `i64::MAX`, meaning "see everything" | it means the opposite: every key with a TTL looked expired, was skipped, never got a tombstone, and **came back alive** on the next read |
 | the LSM scan emitted past a truncated source's boundary | **lost 367 of 1500 keys** with no error at all |
 | `everysec` never pushed log bytes to the kernel | acknowledged writes sat in process memory, where a plain kill destroyed them |
@@ -164,7 +164,9 @@ walk. Spot-checking a few keys would have passed every one of them.
 The two scan bugs at the top only appear when background work runs concurrently
 with a read, so they survived the whole single-threaded suite and were caught by
 CI running the tests in parallel on a different machine. They are pinned now by
-`engine/tests/concurrency.rs`, which reproduces both deterministically.
+`engine/tests/concurrency.rs` — and each of those tests was checked by putting
+its bug back and confirming the test fails, because a regression test that
+cannot fail is worse than none at all.
 
 ---
 
