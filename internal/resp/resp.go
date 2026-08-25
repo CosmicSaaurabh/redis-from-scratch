@@ -1,127 +1,47 @@
+// Package resp implements the Redis Serialization Protocol, versions 2 and 3.
+//
+// The package is split into a request path and a reply path because the two
+// have very different shapes in practice. Clients only ever send an array of
+// bulk strings (or a legacy inline command), so Reader is specialised for that
+// single case instead of parsing a general RESP value tree. Servers send the
+// full type surface, so Writer exposes one method per reply type and degrades
+// RESP3-only types to their RESP2 equivalents when the connection has not
+// upgraded via HELLO 3.
 package resp
 
-import (
-	"bufio"
-	"fmt"
-	"io"
-	"strconv"
+// Protocol type bytes. These are the first byte of every RESP value.
+const (
+	TypeSimpleString = '+'
+	TypeError        = '-'
+	TypeInteger      = ':'
+	TypeBulkString   = '$'
+	TypeArray        = '*'
+
+	// RESP3 additions.
+	TypeNull      = '_'
+	TypeDouble    = ','
+	TypeBoolean   = '#'
+	TypeBlobError = '!'
+	TypeVerbatim  = '='
+	TypeBigNumber = '('
+	TypeMap       = '%'
+	TypeSet       = '~'
+	TypeAttribute = '|'
+	TypePush      = '>'
 )
+
+// Version identifies the protocol dialect used on a connection.
+type Version int
 
 const (
-	STRING  = '+'
-	ERROR   = '-'
-	INTEGER = ':'
-	BULK    = '$'
-	ARRAY   = '*'
+	// RESP2 is the protocol every Redis client understands. It is the default
+	// for a new connection until the client sends HELLO 3.
+	RESP2 Version = 2
+	// RESP3 adds native map, set, double, boolean and push types.
+	RESP3 Version = 3
 )
 
-type Value struct {
-	typ   string
-	str   string
-	num   int64
-	bulk  string
-	array []Value
-}
+// Valid reports whether v is a protocol version this server implements.
+func (v Version) Valid() bool { return v == RESP2 || v == RESP3 }
 
-type Resp struct {
-	reader *bufio.Reader
-}
-
-func NewResp(rd io.Reader) *Resp {
-	return &Resp{
-		bufio.NewReader(rd),
-	}
-}
-
-func (r *Resp) readLine() (line []byte, n int, err error) {
-	for {
-		b, err := r.reader.ReadByte()
-		if err != nil {
-			return nil, 0, err
-		}
-		n += 1
-		line = append(line, b)
-		if len(line) >= 2 && line[len(line)-2] == '\r' {
-			break
-		}
-	}
-
-	return line[:len(line)-2], n, nil
-}
-
-func (r *Resp) readInteger() (x int64, n int, err error) {
-	line, n, err := r.readLine()
-	if err != nil {
-		return 0, 0, err
-	}
-	i64, err := strconv.ParseInt(string(line), 10, 64)
-	if err != nil {
-		return 0, 0, err
-	}
-	return int64(i64), n, nil
-}
-
-func (r *Resp) Read() (Value, error) {
-	_type, err := r.reader.ReadByte()
-	fmt.Println()
-	if err != nil {
-		return Value{}, err
-	}
-
-	switch _type {
-	case ARRAY:
-		return r.readArray()
-	case BULK:
-		return r.readBulk()
-	default:
-		fmt.Printf("Unknown type: %v\n", string(_type))
-		return Value{}, fmt.Errorf("Unknown type: %v", string(_type))
-	}
-}
-
-func (r *Resp) readArray() (Value, error) {
-	v := Value{}
-	v.typ = "array"
-
-	// read length of array
-	length, _, err := r.readInteger()
-	if err != nil {
-		return v, err
-	}
-
-	// foreach line, parse and read the value
-	v.array = make([]Value, length)
-	for i := 0; i < int(length); i++ {
-		val, err := r.Read()
-		if err != nil {
-			return v, err
-		}
-
-		// add parsed value to array
-		v.array[i] = val
-	}
-
-	return v, nil
-}
-
-func (r *Resp) readBulk() (Value, error) {
-	v := Value{}
-
-	v.typ = "bulk"
-
-	len, _, err := r.readInteger()
-	if err != nil {
-		return v, err
-	}
-
-	bulk := make([]byte, len)
-
-	r.reader.Read(bulk)
-
-	v.bulk = string(bulk)
-
-	// Read the trailing CRLF
-	r.readLine()
-
-	return v, nil
-}
+var crlf = []byte{'\r', '\n'}

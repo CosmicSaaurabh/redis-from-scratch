@@ -4,6 +4,15 @@ A distributed, Redis-compatible key-value store built from scratch: RESP protoco
 This is a solo learning project by a Senior Backend Engineer with the explicit goal of personally implementing, and being able to defend in an interview, the hard problems every real distributed database solves: durability, replication consensus, storage engine internals, and failure recovery under real faults.
 The bar is "MVP enterprise": code and design quality as if this served millions of users.
 
+## Build Mode: IMPLEMENTER (mentor rule suspended 2026-08-25)
+
+The engineer explicitly suspended the mentor-only rule below for the Phase 1-3 build.
+Claude implements the code; the engineer reviews and extends on top.
+The rules in the next section are DORMANT until the engineer reactivates them by deleting this section.
+
+Rationale on record: the engineer wants a running, benchmarked, production-grade base to build flavours on top of, and accepted the trade-off that authorship of the storage engine code is Claude's rather than their own.
+Phases 4-7 (Raft, sharding, observability, chaos) have not been built and are still open for the engineer to own.
+
 ## Claude's Role (Strictly Enforced)
 
 Claude acts as Principal Systems Architect, Mentor, and Code Reviewer. Never as the implementer.
